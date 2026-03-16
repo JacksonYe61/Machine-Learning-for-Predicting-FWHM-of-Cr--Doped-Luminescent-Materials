@@ -1,0 +1,399 @@
+def preprocess_data(data1, data4):
+    common_cont_feats = ["Band Gap (eV)", "Ex (Excitation Wavelength)", "Em (Emission Wavelength)", 
+                         "Lattice a (Å)", "Lattice b (Å)", "Lattice c (Å)", 
+                         "Lattice α (°)", "Lattice β (°)", "Lattice γ (°)", "Zeff"]
+    target_unique_cont_feats = ["Grain Size", "Crystallinity", "Annealing State"]
+    common_cate_feats = ["Space Group"]
+    target_unique_cate_feats = ["Crystal System", "Point Group"]
+    target_col = "FWHM"
+
+    data4_fuzzy = data4.copy()
+    ambiguous_idx = []
+    print(f"Ambiguous samples in target domain: {ambiguous_idx}, total: {len(ambiguous_idx)} (no ambiguous data)")
+
+
+    def clean_numeric_col(series):
+        series = series.astype(str)
+        series = series.str.replace(r'[^\d./]', '', regex=True)
+        series = series.replace('', np.nan)
+        
+        def parse_val(val):
+            if pd.isna(val):
+                return np.nan
+            if '/' in val:
+                try:
+                    nums = list(map(float, val.split('/')))
+                    return np.mean(nums)
+                except:
+                    return np.nan
+            try:
+                return float(val)
+            except:
+                return np.nan
+        
+        series = series.apply(parse_val)
+        median_val = series.median()
+        return series.fillna(median_val)
+
+    source_common_cont = data1[common_cont_feats].copy()
+    for feat in common_cont_feats:
+        source_common_cont[feat] = clean_numeric_col(source_common_cont[feat])
+    
+    target_common_cont = data4_fuzzy[common_cont_feats].copy()
+    target_unique_cont = data4_fuzzy[target_unique_cont_feats].copy()
+    for feat in common_cont_feats:
+        target_common_cont[feat] = clean_numeric_col(target_common_cont[feat])
+    for feat in target_unique_cont_feats:
+        target_unique_cont[feat] = clean_numeric_col(target_unique_cont[feat])
+
+    scaler_common = StandardScaler()
+    X_source_common = scaler_common.fit_transform(source_common_cont)
+    X_target_common = scaler_common.transform(target_common_cont)
+    scaler_unique = StandardScaler()
+    X_target_unique = scaler_unique.fit_transform(target_unique_cont)
+
+    all_cate_data = pd.DataFrame()
+    for feat in common_cate_feats:
+        all_cate_data[feat] = data1[feat].fillna("Unknown").astype(str)
+    for feat in common_cate_feats + target_unique_cate_feats:
+        if feat not in all_cate_data.columns:
+            all_cate_data[feat] = data4_fuzzy[feat].fillna("Unknown").astype(str)
+        else:
+            all_cate_data[feat] = pd.concat([
+                all_cate_data[feat],
+                data4_fuzzy[feat].fillna("Unknown").astype(str)
+            ], ignore_index=True)
+    encoder = OneHotEncoder(sparse_output=False, drop="first", handle_unknown="ignore")
+    encoder.fit(all_cate_data)
+
+    source_cate = data1[common_cate_feats].fillna("Unknown").astype(str)
+    for feat in target_unique_cate_feats:
+        source_cate[feat] = "Unknown"
+    X_source_cate = encoder.transform(source_cate[common_cate_feats + target_unique_cate_feats])
+    target_cate = data4_fuzzy[common_cate_feats + target_unique_cate_feats].fillna("Unknown").astype(str)
+    X_target_cate = encoder.transform(target_cate)
+
+    source_full = np.hstack([X_source_common, X_source_cate])
+    temp_rfr = RandomForestRegressor(n_estimators=40, max_depth=6, random_state=42)
+    temp_rfr.fit(source_full, data1[target_col].values.flatten())
+    sfm = SelectFromModel(temp_rfr, threshold='mean', prefit=True)
+    X_source = sfm.transform(source_full)
+    y_source = data1[target_col].values.flatten()
+
+
+    X_target_cont = np.hstack([X_target_common, X_target_unique])
+    target_full = np.hstack([X_target_cont, X_target_cate])
+    y_target_original = data4_fuzzy[target_col].values.flatten()
+
+    def augment_data(X, y, n_aug=1):
+        augmented_X = []
+        augmented_y = []
+        if n_aug > 0:
+            noise = np.random.normal(0, 0.005, size=X.shape)
+            for i in range(n_aug):
+                augmented_X.append(X + noise * (i+1))
+                augmented_y.append(y)
+        X_aug = np.vstack([X] + augmented_X) if augmented_X else X
+        y_aug = np.hstack([y] + augmented_y) if augmented_y else y
+        return X_aug, y_aug
+
+    X_target, y_target = augment_data(target_full, y_target_original, n_aug=1)
+
+    print(f"Source domain: Feature count={X_source.shape[1]}, Sample count={len(y_source)}")
+    print(f"Target domain: Feature count={X_target.shape[1]}, Augmented sample count={len(y_target)}")
+    return (
+        X_source, y_source, X_target, y_target, encoder, scaler_common, scaler_unique,
+        ambiguous_idx, common_cont_feats, target_unique_cont_feats,
+        common_cate_feats + target_unique_cate_feats, target_col, sfm, clean_numeric_col
+    )
+
+(
+    X_source, y_source, X_target, y_target, encoder, scaler_common, scaler_unique,
+    ambiguous_idx, common_cont_feats, target_unique_cont_feats, cate_feats, target_col, sfm, clean_numeric_col
+) = preprocess_data(data1, data4)
+
+print("Preprocessing completed:")
+print("Source domain feature matrix shape:", X_source.shape)
+print("Target domain augmented feature matrix shape:", X_target.shape)
+print("="*50)
+
+
+def train_source_models(X_source, y_source):
+    models = {
+        "RFR": RandomForestRegressor(
+            n_estimators=30,
+            max_depth=5,
+            min_samples_leaf=3,
+            random_state=42,
+            oob_score=True
+        ),
+        "DTR": DecisionTreeRegressor(
+            max_depth=3,
+            min_samples_leaf=3,
+            random_state=42
+        ),
+        "GBR": GradientBoostingRegressor(
+            n_estimators=30,
+            learning_rate=0.1,
+            max_depth=3,
+            subsample=0.8,
+            random_state=42,
+            validation_fraction=0.2,
+            n_iter_no_change=5,
+            tol=0.001
+        ),
+        "SVR": SVR(
+            kernel="rbf", 
+            C=0.3,
+            gamma=0.05,
+            epsilon=0.1
+        ),
+        "BPNN": MLPRegressor(
+            hidden_layer_sizes=(15, 8),
+            max_iter=600,
+            alpha=0.05,
+            early_stopping=True,
+            validation_fraction=0.2,
+            n_iter_no_change=5,
+            random_state=42
+        )
+    }
+
+    X_s_train, X_s_test, y_s_train, y_s_test = train_test_split(
+        X_source, y_source, test_size=0.2,
+        random_state=42, shuffle=True
+    )
+    cv = KFold(n_splits=5, shuffle=True, random_state=42)
+
+    source_model_info = {}
+    for name, model in models.items():
+        print(f"\nTraining source domain model: {name}")
+        cv_r2, cv_rmse, cv_std = [], [], []
+        for train_idx, val_idx in cv.split(X_source):
+            X_tr, X_val = X_source[train_idx], X_source[val_idx]
+            y_tr, y_val = y_source[train_idx], y_source[val_idx]
+            model.fit(X_tr, y_tr)
+            y_val_pred = model.predict(X_val)
+            cv_r2.append(r2_score(y_val, y_val_pred))
+            cv_rmse.append(np.sqrt(mean_squared_error(y_val, y_val_pred)))
+            cv_std.append(np.std(y_val_pred))
+        
+        model.fit(X_s_train, y_s_train)
+        y_train_pred = model.predict(X_s_train)
+        y_test_pred = model.predict(X_s_test)
+        
+        train_rmse = np.sqrt(mean_squared_error(y_s_train, y_train_pred))
+        train_r2 = r2_score(y_s_train, y_train_pred)
+        test_rmse = np.sqrt(mean_squared_error(y_s_test, y_test_pred))
+        test_r2 = r2_score(y_s_test, y_test_pred)
+        test_mape = mean_absolute_percentage_error(y_s_test, y_test_pred) * 100
+        overfit_gap = train_r2 - test_r2
+
+        print(f"{name} overfitting gap (train-test R²): {overfit_gap:.3f}")
+        if overfit_gap > 0.2:
+            print(f"Warning: {name} has significant overfitting!")
+
+        source_model_info[name] = {
+            "model": model,
+            "y_true_train": y_s_train,
+            "y_pred_train": y_train_pred,
+            "y_true_test": y_s_test,
+            "y_pred_test": y_test_pred,
+            "train_rmse": train_rmse,
+            "train_r2": train_r2,
+            "test_rmse": test_rmse,
+            "test_r2": test_r2,
+            "test_mape": test_mape,
+            "cv_r2": cv_r2,
+            "cv_rmse": cv_rmse,
+            "cv_std": cv_std,
+            "overfit_gap": overfit_gap
+        }
+        print(f"{name}: Train RMSE={train_rmse:.2f}, R²={train_r2:.2f}; Test RMSE={test_rmse:.2f}, R²={test_r2:.2f}, MAPE={test_mape:.2f}%")
+
+    def model_selection_score(name):
+        info = source_model_info[name]
+        return info["test_r2"] - 0.3 * info["overfit_gap"]
+    
+    best_fp_name = max(source_model_info.keys(), key=model_selection_score)
+    best_fp_model = source_model_info[best_fp_name]["model"]
+    best_fp_metrics = {
+        "test_R²": source_model_info[best_fp_name]["test_r2"],
+        "test_MAPE": source_model_info[best_fp_name]["test_mape"],
+        "overfit_gap": source_model_info[best_fp_name]["overfit_gap"]
+    }
+    print(f"\nOptimal F-P model: {best_fp_name}, Test set R²={best_fp_metrics['test_R²']:.3f}, Overfit gap={best_fp_metrics['overfit_gap']:.3f}")
+
+    X_bp = np.hstack([X_source, y_source.reshape(-1, 1)])
+    y_bp = data1["Lattice a (Å)"] * data1["Lattice b (Å)"] * data1["Lattice c (Å)"]
+    best_bp_model = type(best_fp_model)(**best_fp_model.get_params())
+    best_bp_model.fit(X_bp, y_bp)
+    bp_r2 = r2_score(y_bp, best_bp_model.predict(X_bp))
+    bp_input_feat_num = X_bp.shape[1]
+    print(f"B-P model R²: {bp_r2:.3f}")
+    print(f"B-P model actual input feature count during training: {bp_input_feat_num}")
+
+    return source_model_info, best_fp_model, best_bp_model, best_fp_name, best_fp_metrics, bp_input_feat_num
+
+source_model_info, best_fp_model, best_bp_model, best_fp_name, best_fp_metrics, bp_input_feat_num = train_source_models(X_source, y_source)
+
+def strut_transfer(source_model_info, X_source, X_target, y_target, ambiguous_idx):
+    transfer_model_info = {}
+    clear_idx = [i for i in range(len(y_target))]
+    X_clear = X_target[clear_idx]
+    y_clear = y_target[clear_idx]
+    print(f"\nClear samples in target domain: {len(clear_idx)} (no ambiguous data, use all samples)")
+
+    for name, info in source_model_info.items():
+        source_model = info["model"]
+        print(f"\nTransferring model: {name}")
+        
+        if isinstance(source_model, RandomForestRegressor):
+            target_model = RandomForestRegressor(
+                n_estimators=source_model.n_estimators,
+                max_depth=source_model.max_depth,
+                min_samples_leaf=source_model.min_samples_leaf,
+                random_state=42
+            )
+            target_model.estimators_ = source_model.estimators_
+            source_feat_num = X_source.shape[1]
+            target_feat_num = X_target.shape[1]
+            print(f"Transfer adaptation: Source feature count={source_feat_num}, Target feature count={target_feat_num}")
+            for tree in target_model.estimators_:
+                tree_struc = tree.tree_
+                for node_id in range(tree_struc.node_count):
+                    if tree_struc.feature[node_id] == -2:
+                        continue
+                    feat_idx = tree_struc.feature[node_id]
+                    if feat_idx >= source_feat_num:
+                        continue
+                    src_mean = X_source[:, feat_idx].mean()
+                    tgt_mean = X_clear[:, feat_idx].mean()
+                    ratio = np.clip((tgt_mean - src_mean)/(src_mean+1e-8), -0.15, 0.15)
+                    tree_struc.threshold[node_id] *= (1 + ratio)
+        else:
+            target_model = type(source_model)(**source_model.get_params())
+        
+        cv = KFold(n_splits=min(3, len(X_clear)), shuffle=True, random_state=42)
+        cv_r2, cv_rmse, cv_std = [], [], []
+        for train_idx, val_idx in cv.split(X_clear):
+            X_tr, X_val = X_clear[train_idx], X_clear[val_idx]
+            y_tr, y_val = y_clear[train_idx], y_clear[val_idx]
+            target_model.fit(X_tr, y_tr)
+            y_val_pred = target_model.predict(X_val)
+            cv_r2.append(r2_score(y_val, y_val_pred))
+            cv_rmse.append(np.sqrt(mean_squared_error(y_val, y_val_pred)))
+            cv_std.append(np.std(y_val_pred))
+        
+        target_model.fit(X_clear, y_clear)
+        y_tl_pred = target_model.predict(X_clear)
+        tl_r2 = r2_score(y_clear, y_tl_pred)
+        tl_rmse = np.sqrt(mean_squared_error(y_clear, y_tl_pred))
+        tl_mape = mean_absolute_percentage_error(y_clear, y_tl_pred) * 100
+
+        cv_mean_r2 = np.mean(cv_r2)
+        overfit_tl = tl_r2 - cv_mean_r2
+        print(f"{name} after transfer: R²={tl_r2:.3f}(CV={cv_mean_r2:.3f}), RMSE={tl_rmse:.2f}, MAPE={tl_mape:.2f}%, Overfit gap={overfit_tl:.3f}")
+    
+        transfer_model_info[name] = {
+            "model": target_model,
+            "y_true": y_clear,
+            "y_pred": y_tl_pred,
+            "tl_r2": tl_r2,
+            "tl_rmse": tl_rmse,
+            "tl_mape": tl_mape,
+            "cv_r2": cv_r2,
+            "cv_rmse": cv_rmse,
+            "cv_std": cv_std
+        }
+    
+    def tl_selection_score(name):
+        info = transfer_model_info[name]
+        cv_mean_r2 = np.mean(info["cv_r2"])
+        overfit_tl = info["tl_r2"] - cv_mean_r2
+        return cv_mean_r2 - 0.3 * overfit_tl
+    
+    best_tl_name = max(transfer_model_info.keys(), key=tl_selection_score)
+    tl_r2 = transfer_model_info[best_tl_name]["tl_r2"]
+    tl_mape = transfer_model_info[best_tl_name]["tl_mape"]
+    fp_tl_model = transfer_model_info[best_tl_name]["model"]
+    return fp_tl_model, X_clear, y_clear, tl_r2, tl_mape, transfer_model_info
+
+fp_tl_model, X_clear, y_clear, tl_r2, tl_mape, transfer_model_info = strut_transfer(source_model_info, X_source, X_target, y_target, ambiguous_idx)
+
+def train_final_model(X_target, y_target):
+    final_models = {
+        "RFR": RandomForestRegressor(
+            n_estimators=20,
+            max_depth=3,
+            min_samples_leaf=2,
+            random_state=42,
+            oob_score=True if len(X_target)>=10 else False
+        ),
+        "DTR": DecisionTreeRegressor(
+            max_depth=2,
+            min_samples_leaf=2,
+            random_state=42
+        ),
+        "GBR": GradientBoostingRegressor(
+            n_estimators=20,
+            learning_rate=0.07,
+            max_depth=2,
+            subsample=0.8,
+            random_state=42,
+            validation_fraction=0.2,
+            n_iter_no_change=3
+        ),
+        "SVR": SVR(
+            kernel="rbf",
+            C=0.3,
+            gamma=0.05,
+            epsilon=0.1
+        ),
+        "BPNN": MLPRegressor(
+            hidden_layer_sizes=(10, 6),
+            max_iter=400,
+            alpha=0.1,
+            early_stopping=True,
+            validation_fraction=0.2,
+            random_state=42
+        )
+    }
+
+    final_results = {}
+    cv_folds = min(3, len(X_target))
+    cv = KFold(n_splits=cv_folds, shuffle=True, random_state=42)
+    print(f"\nFinal model cross-validation folds: {cv_folds}")
+
+    for name, model in final_models.items():
+        cv_scores = cross_val_score(
+            model, X_target, y_target,
+            cv=cv, scoring="r2"
+        )
+        model.fit(X_target, y_target)
+        y_pred = model.predict(X_target)
+        train_r2 = r2_score(y_target, y_pred)
+        cv_mean_r2 = np.mean(cv_scores)
+        overfit_final = train_r2 - cv_mean_r2
+        
+        final_results[name] = {
+            "CV_R²": cv_mean_r2,
+            "CV_R²_std": np.std(cv_scores),
+            "Train_R²": train_r2,
+            "Overfit_Gap": overfit_final,
+            "MAPE": mean_absolute_percentage_error(y_target, y_pred)*100,
+            "y_pred": y_pred
+        }
+        print(f"\nFinal model {name}: CV_R²={cv_mean_r2:.3f}±{np.std(cv_scores):.3f}, Train_R²={train_r2:.3f}, Overfit gap={overfit_final:.3f}, MAPE={final_results[name]['MAPE']:.2f}%")
+
+    def final_selection_score(name):
+        res = final_results[name]
+        return res["CV_R²"] - 0.3 * res["Overfit_Gap"]
+    
+    best_final_name = max(final_results.keys(), key=final_selection_score)
+    best_final_model = final_models[best_final_name]
+    best_final_metrics = final_results[best_final_name]
+    print(f"\nOptimal final model: {best_final_name}, CV_R²={best_final_metrics['CV_R²']:.3f}, Overfit gap={best_final_metrics['Overfit_Gap']:.3f}")
+    return best_final_model, best_final_name, best_final_metrics, final_results
+
+best_final_model, best_final_name, best_final_metrics, final_results = train_final_model(X_target, y_target)
